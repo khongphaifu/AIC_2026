@@ -1,4 +1,4 @@
-import os, glob, json, re, pickle
+import os, glob, json, re, pickle, csv, bisect
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -7,7 +7,8 @@ from pathlib import Path
 from transformers import CLIPProcessor, CLIPModel
 from collections import deque
 
-from config import DATA_DIR, CLIP_FEATURES_DIR, OBJECTS_DIR, OCR_DIR
+from config import DATA_DIR, CLIP_FEATURES_DIR, OBJECTS_DIR, OCR_DIR, MAP_KEYFRAMES_DIR, ASR_DIR
+from preprocess import KeyframeMapper, mapper, _clean_video_id, ASRPreprocessor, clean_asr_text
 
 HNSW_M = 32
 HNSW_EF_CONSTRUCTION = 80
@@ -17,13 +18,11 @@ CACHE_FAISS_PATH = os.path.join(DATA_DIR, "cache_faiss.index")
 CACHE_META_CLIP_PATH = os.path.join(DATA_DIR, "cache_meta_clip.pkl")
 CACHE_META_OD_PATH = os.path.join(DATA_DIR, "cache_meta_od.pkl")
 CACHE_META_OCR_PATH = os.path.join(DATA_DIR, "cache_meta_ocr.pkl")
+CACHE_META_MAP_KF_PATH = os.path.join(DATA_DIR, "cache_meta_map_kf.pkl")
+CACHE_META_ASR_PATH = os.path.join(DATA_DIR, "cache_meta_asr.pkl")
 
 def _make_video_key(raw_name):
-    name = str(raw_name)
-    for ext in ['.npy', '.mp4', '.avi', '.mov', '.mkv']:
-        if name.endswith(ext):
-            return name[:-len(ext)]
-    return name
+    return _clean_video_id(raw_name)
 
 def load_clip_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -34,7 +33,6 @@ def load_clip_model():
     return device, model, processor
 
 def load_faiss_database():
-    # 1. Ưu tiên nạp siêu tốc từ cache FAISS nhị phân đã lưu (< 0.2s)
     if os.path.exists(CACHE_FAISS_PATH) and os.path.exists(CACHE_META_CLIP_PATH):
         try:
             print(f"[*] ⚡ Nạp FAISS siêu tốc từ cache: {CACHE_FAISS_PATH}")
@@ -46,7 +44,6 @@ def load_faiss_database():
         except Exception as e:
             print(f"[!] Lỗi khi đọc cache FAISS ({e}), chuyển sang nạp thô từ .npy...")
 
-    # 2. Fallback: nạp từ file .npy nếu chưa có cache
     print(f"[*] Đang nạp đặc trưng CLIP từ thư mục: {CLIP_FEATURES_DIR}")
     npy_files = sorted(glob.glob(os.path.join(CLIP_FEATURES_DIR, "*.npy")))
     print(f"[DEBUG] Tìm thấy {len(npy_files)} file .npy trong {CLIP_FEATURES_DIR}")
@@ -81,7 +78,6 @@ def load_faiss_database():
             vkey = _make_video_key(raw_name)
             key_to_faiss_id[(vkey, fid)] = internal_id
             
-        # Tự động lưu cache cho các lần chạy sau
         try:
             faiss.write_index(index, CACHE_FAISS_PATH)
             with open(CACHE_META_CLIP_PATH, "wb") as f:
@@ -95,7 +91,6 @@ def load_faiss_database():
     return all_features, metadata_clip, index, key_to_faiss_id
 
 def load_od_metadata():
-    # 1. Ưu tiên nạp siêu tốc từ cache gộp (< 0.2s)
     if os.path.exists(CACHE_META_OD_PATH):
         try:
             print(f"[*] ⚡ Nạp Object Detection siêu tốc từ cache: {CACHE_META_OD_PATH}")
@@ -124,7 +119,6 @@ def load_od_metadata():
             except Exception as e:
                 print(f"[DEBUG] Lỗi khi đọc {json_file}: {e}")
                 
-    # Tự động lưu cache OD
     try:
         with open(CACHE_META_OD_PATH, "wb") as f:
             pickle.dump(metadata_OD, f)
@@ -135,7 +129,6 @@ def load_od_metadata():
     return metadata_OD
 
 def load_ocr_metadata():
-    # 1. Ưu tiên nạp siêu tốc từ cache gộp (< 0.1s)
     if os.path.exists(CACHE_META_OCR_PATH):
         try:
             print(f"[*] ⚡ Nạp OCR siêu tốc từ cache: {CACHE_META_OCR_PATH}")
@@ -155,7 +148,6 @@ def load_ocr_metadata():
         except Exception as e:
             print(f"[DEBUG] Lỗi khi đọc {json_file}: {e}")
             
-    # Tự động lưu cache OCR
     try:
         with open(CACHE_META_OCR_PATH, "wb") as f:
             pickle.dump(loaded_ocr_data, f)
@@ -165,17 +157,64 @@ def load_ocr_metadata():
 
     return loaded_ocr_data
 
+def load_map_keyframes():
+    return mapper.timeline
+
+def load_asr_metadata():
+    if os.path.exists(CACHE_META_ASR_PATH):
+        try:
+            print(f"[*] ⚡ Nạp ASR siêu tốc từ cache: {CACHE_META_ASR_PATH}")
+            with open(CACHE_META_ASR_PATH, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"[!] Lỗi khi đọc cache ASR ({e}), nạp từ JSON...")
+
+    asr_data = {}
+    target_dir = ASR_DIR
+    if not Path(target_dir).exists():
+        fallback_dir = os.path.join(DATA_DIR, "asr_data")
+        if Path(fallback_dir).exists():
+            target_dir = fallback_dir
+
+    if not Path(target_dir).exists():
+        print(f"[DEBUG] Không tìm thấy thư mục ASR: {target_dir}")
+        return asr_data
+
+    json_files = sorted(glob.glob(os.path.join(target_dir, "*.json")))
+    print(f"[*] Đang nạp ASR từ: {target_dir} ({len(json_files)} file)")
+
+    for file_path in json_files:
+        video_id = _make_video_key(os.path.basename(file_path))
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                captions = json.load(f)
+            asr_data[video_id] = captions
+        except Exception as e:
+            print(f"[DEBUG] Lỗi khi đọc {file_path}: {e}")
+
+    try:
+        with open(CACHE_META_ASR_PATH, "wb") as f:
+            pickle.dump(asr_data, f)
+        print(f"[*] Đã tự động tạo cache ASR tại {CACHE_META_ASR_PATH}")
+    except Exception as e:
+        print(f"[!] Không thể lưu cache ASR: {e}")
+
+    return asr_data
+
 DEFAULT_CLIP_CANDIDATE_POOL = 500
+DEFAULT_ASR_PADDING_SEC = 15.0
 
 class AICSearchEngine:
     MODULE_FUNCS = {
         "clip": "search_clip",
         "od": "search_od",
         "ocr": "search_ocr",
+        "asr": "search_asr",
     }
 
     def __init__(self, device, model, processor, all_features, metadata_clip,
-                 index, key_to_faiss_id, metadata_OD, loaded_ocr_data):
+                 index, key_to_faiss_id, metadata_OD, loaded_ocr_data,
+                 map_keyframes=None, asr_data=None, kf_mapper=None):
         self.device = device
         self.model = model
         self.processor = processor
@@ -185,6 +224,12 @@ class AICSearchEngine:
         self.key_to_faiss_id = key_to_faiss_id
         self.metadata_OD = metadata_OD
         self.loaded_ocr_data = loaded_ocr_data
+
+        self.map_keyframes = map_keyframes or {}
+        self.asr_data = asr_data or {}
+        self.mapper = kf_mapper or mapper
+
+        self.asr_index, self.cleaned_asr = ASRPreprocessor.load_cache()
 
     def min_max_normalize(self, scores):
         scores = np.asarray(scores, dtype=np.float32)
@@ -203,11 +248,7 @@ class AICSearchEngine:
         return sum(1 for word in query_words if word in text_words) / len(query_words)
 
     def _make_video_key(self, raw_name):
-        name = str(raw_name)
-        for ext in ['.npy', '.mp4', '.avi', '.mov', '.mkv']:
-            if name.endswith(ext):
-                return name[:-len(ext)]
-        return name
+        return _clean_video_id(raw_name)
 
     def _normalize_allowed(self, allowed_frames):
         if allowed_frames is None:
@@ -232,6 +273,15 @@ class AICSearchEngine:
         else:
             items = fusion_output or []
         return [(item["video_id"], item["frame_id"]) for item in items]
+
+    def _frames_in_range(self, video_id, lo, hi):
+        t_list = self.mapper.timeline.get(video_id, [])
+        if not t_list:
+            return []
+        times = [x[0] for x in t_list]
+        left = bisect.bisect_left(times, lo)
+        right = bisect.bisect_right(times, hi)
+        return [t_list[i][1] for i in range(left, right)]
 
     def search_clip(self, text_query, allowed_frames=None, ef_search=None, candidate_pool=None):
         results = []
@@ -265,9 +315,14 @@ class AICSearchEngine:
         norm_c = self.min_max_normalize(np.asarray(scores))
         for fid, sc in zip(fids, norm_c):
             video_key = self._make_video_key(self.metadata_clip[fid][0])
+            frame_n = int(self.metadata_clip[fid][1])
+            info = self.mapper.get_info(video_key, frame_n)
             results.append({
                 "video_id": video_key,
-                "frame_id": int(self.metadata_clip[fid][1]),
+                "frame_id": frame_n,
+                "n": frame_n,
+                "frame_idx": info["frame_idx"],
+                "pts_time": info["pts_time"],
                 "score": float(sc)
             })
 
@@ -304,7 +359,15 @@ class AICSearchEngine:
 
         norm_od = self.min_max_normalize([r["raw_score"] for r in raw])
         for r, sc in zip(raw, norm_od):
-            results.append({"video_id": r["video_id"], "frame_id": r["frame_id"], "score": float(sc)})
+            info = self.mapper.get_info(r["video_id"], r["frame_id"])
+            results.append({
+                "video_id": r["video_id"],
+                "frame_id": r["frame_id"],
+                "n": r["frame_id"],
+                "frame_idx": info["frame_idx"],
+                "pts_time": info["pts_time"],
+                "score": float(sc)
+            })
         return results
 
     def search_ocr(self, text_query, allowed_frames=None):
@@ -325,11 +388,113 @@ class AICSearchEngine:
         raw_ocr = [self._ocr_similarity(text_query, item["text"]) for item in items]
         norm_ocr = self.min_max_normalize(raw_ocr)
         for item, sc in zip(items, norm_ocr):
+            vkey = self._make_video_key(item["video_id"])
+            fn = item["frame_n"]
+            info = self.mapper.get_info(vkey, fn)
             results.append({
-                "video_id": self._make_video_key(item["video_id"]),
-                "frame_id": item["frame_n"],
+                "video_id": vkey,
+                "frame_id": fn,
+                "n": fn,
+                "frame_idx": info["frame_idx"],
+                "pts_time": info["pts_time"],
                 "score": float(sc)
             })
+        return results
+
+    def search_asr(self, text_query, allowed_frames=None, padding_sec=DEFAULT_ASR_PADDING_SEC):
+        results = []
+        if not text_query:
+            return results
+
+        allowed_set = self._normalize_allowed(allowed_frames)
+        allowed_videos = {v for v, _ in allowed_set} if allowed_set is not None else None
+
+        # 1) Inverted Index tra cứu tức thì < 1ms
+        if self.asr_index is not None:
+            query_clean = clean_asr_text(text_query)
+            q_words = query_clean.split()
+            matched_candidates = {}
+            for w in q_words:
+                hits = self.asr_index.get(w, [])
+                for vid, kf_n in hits:
+                    if allowed_videos is not None and vid not in allowed_videos:
+                        continue
+                    if allowed_set is not None and (vid, kf_n) not in allowed_set:
+                        continue
+                    matched_candidates[(vid, kf_n)] = matched_candidates.get((vid, kf_n), 0) + 1
+
+            if matched_candidates:
+                raw_scores = [c for c in matched_candidates.values()]
+                norm_sc = self.min_max_normalize(raw_scores)
+                for (vid, kf_n), sc in zip(matched_candidates.keys(), norm_sc):
+                    info = self.mapper.get_info(vid, kf_n)
+                    results.append({
+                        "video_id": vid,
+                        "frame_id": kf_n,
+                        "n": kf_n,
+                        "frame_idx": info["frame_idx"],
+                        "pts_time": info["pts_time"],
+                        "score": float(sc)
+                    })
+                return results
+
+        # 2) Fallback Dynamic Search
+        if not self.asr_data:
+            return results
+
+        video_intervals = {}
+        for video_id, captions in self.asr_data.items():
+            if allowed_videos is not None and video_id not in allowed_videos:
+                continue
+            if video_id not in self.mapper.timeline:
+                continue
+
+            for cap in captions:
+                score = self._ocr_similarity(text_query, cap.get("text", ""))
+                if score <= 0:
+                    continue
+                lo = max(0.0, float(cap.get("start", 0.0)) - float(padding_sec))
+                hi = float(cap.get("end", 0.0)) + float(padding_sec)
+                video_intervals.setdefault(video_id, []).append((lo, hi, score))
+
+        if not video_intervals:
+            return results
+
+        raw = []
+        for video_id, intervals in video_intervals.items():
+            intervals.sort(key=lambda x: x[0])
+            merged = []
+            cur_lo, cur_hi, cur_sc = intervals[0]
+            for lo, hi, sc in intervals[1:]:
+                if lo <= cur_hi:
+                    cur_hi = max(cur_hi, hi)
+                    cur_sc = max(cur_sc, sc)
+                else:
+                    merged.append((cur_lo, cur_hi, cur_sc))
+                    cur_lo, cur_hi, cur_sc = lo, hi, sc
+            merged.append((cur_lo, cur_hi, cur_sc))
+
+            for lo, hi, sc in merged:
+                for frame_id in self._frames_in_range(video_id, lo, hi):
+                    if allowed_set is not None and (video_id, frame_id) not in allowed_set:
+                        continue
+                    raw.append({"video_id": video_id, "frame_id": frame_id, "raw_score": sc})
+
+        if not raw:
+            return results
+
+        norm_scores = self.min_max_normalize([r["raw_score"] for r in raw])
+        for r, sc in zip(raw, norm_scores):
+            info = self.mapper.get_info(r["video_id"], r["frame_id"])
+            results.append({
+                "video_id": r["video_id"],
+                "frame_id": r["frame_id"],
+                "n": r["frame_id"],
+                "frame_idx": info["frame_idx"],
+                "pts_time": info["pts_time"],
+                "score": float(sc)
+            })
+
         return results
 
     def _fuse_modules(self, modules, allowed_frames=None):
@@ -380,10 +545,15 @@ class AICSearchEngine:
         fusion_results = []
         for key, final_score in combined.items():
             video_id, frame_id = key
+            info = self.mapper.get_info(video_id, frame_id)
             per_module_scores = {f"{name}_score": sc for name, sc in per_module[key].items()}
             fusion_results.append({
                 "video_id": video_id,
                 "frame_id": frame_id,
+                "n": frame_id,
+                "frame_idx": info["frame_idx"],
+                "pts_time": info["pts_time"],
+                "pts_time_ms": info["pts_time_ms"],
                 "score": float(final_score),
                 **per_module_scores
             })

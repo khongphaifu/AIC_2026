@@ -4,8 +4,9 @@ import importlib
 import math
 import backend
 from config import KEYFRAME_DIR, VIDEOS_DIR
+from preprocess import mapper, ASRPreprocessor
 
-st.set_page_config(page_title="AIC 2026 Studio", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="AIC 2026 Studio - vitrivr Style", page_icon="⚡", layout="wide")
 
 # CSS dark-mode vitrivr cao cấp & Thẻ ảnh click trực tiếp 100% sạch sẽ
 st.markdown("""
@@ -59,11 +60,21 @@ st.markdown("""
         margin-bottom: 2px;
         pointer-events: none;
     }
-    .meta-tag {
+    .meta-tag-primary {
         font-size: 0.78rem;
-        color: #c9d1d9;
+        font-weight: 600;
+        color: #58a6ff;
         display: block;
         margin-top: 3px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        pointer-events: none;
+    }
+    .meta-tag-secondary {
+        font-size: 0.72rem;
+        color: #8b949e;
+        display: block;
         margin-bottom: 2px;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -84,17 +95,19 @@ def safe_fragment(func):
         return st.fragment(func)
     return func
 
-@st.cache_resource(show_spinner="🧠 Đang nạp AI Models & Dữ liệu...")
+@st.cache_resource(show_spinner="🧠 Đang nạp AI Models & Dữ liệu (CLIP, OD, OCR, ASR)...")
 def load_resources():
     importlib.reload(backend)
     device, model, processor = backend.load_clip_model()
     all_features, metadata_clip, index, key_to_faiss_id = backend.load_faiss_database()
     metadata_OD = backend.load_od_metadata()
     loaded_ocr_data = backend.load_ocr_metadata()
-    return device, model, processor, all_features, metadata_clip, index, key_to_faiss_id, metadata_OD, loaded_ocr_data
+    map_keyframes = backend.load_map_keyframes()
+    asr_data = backend.load_asr_metadata()
+    return device, model, processor, all_features, metadata_clip, index, key_to_faiss_id, metadata_OD, loaded_ocr_data, map_keyframes, asr_data
 
-device, model, processor, all_features, metadata_clip, index, key_to_faiss_id, metadata_OD, loaded_ocr_data = load_resources()
-engine = backend.AICSearchEngine(device, model, processor, all_features, metadata_clip, index, key_to_faiss_id, metadata_OD, loaded_ocr_data)
+device, model, processor, all_features, metadata_clip, index, key_to_faiss_id, metadata_OD, loaded_ocr_data, map_keyframes, asr_data = load_resources()
+engine = backend.AICSearchEngine(device, model, processor, all_features, metadata_clip, index, key_to_faiss_id, metadata_OD, loaded_ocr_data, map_keyframes, asr_data, kf_mapper=mapper)
 
 # URL tĩnh trực tiếp phục vụ HTTP siêu tốc và browser caching
 def get_image_url(video_id, frame_id):
@@ -141,6 +154,94 @@ def get_dataset_keyframes(_metadata_clip, video_filter):
             if backend._make_video_key(item[0]) == video_filter
         ]
 
+# =====================================================================
+# THUẬT TOÁN TỰ ĐỘNG CÂN BẰNG TRỌNG SỐ CHO TỔNG BẰNG 100%
+# =====================================================================
+def rebalance_weights_on_change(target, changed_key, new_val):
+    active = [m for m in ['clip', 'od', 'ocr', 'asr'] if target.get(f'use_{m}', False)]
+    if not active or len(active) == 1:
+        if active:
+            target[f'weight_{active[0]}'] = 100
+        return
+    if changed_key not in active:
+        return
+
+    others = [m for m in active if m != changed_key]
+    new_val = max(0, min(100, int(new_val)))
+    target[f'weight_{changed_key}'] = new_val
+    remaining = 100 - new_val
+
+    current_others_sum = sum(target.get(f'weight_{m}', 0) for m in others)
+    new_others = {}
+    if current_others_sum > 0:
+        allocated = 0
+        for m in others[:-1]:
+            w = int(round(target.get(f'weight_{m}', 0) * remaining / current_others_sum))
+            new_others[m] = w
+            allocated += w
+        new_others[others[-1]] = remaining - allocated
+    else:
+        each = remaining // len(others)
+        allocated = 0
+        for m in others[:-1]:
+            new_others[m] = each
+            allocated += each
+        new_others[others[-1]] = remaining - allocated
+
+    for m, w in new_others.items():
+        target[f'weight_{m}'] = max(0, min(100, w))
+
+def rebalance_weights_on_toggle(target, toggled_key, is_on):
+    target[f'use_{toggled_key}'] = is_on
+    active = [m for m in ['clip', 'od', 'ocr', 'asr'] if target.get(f'use_{m}', False)]
+    if not active:
+        for m in ['clip', 'od', 'ocr', 'asr']:
+            target[f'weight_{m}'] = 0
+        return
+    if len(active) == 1:
+        for m in ['clip', 'od', 'ocr', 'asr']:
+            target[f'weight_{m}'] = 100 if m == active[0] else 0
+        return
+
+    if not is_on:
+        target[f'weight_{toggled_key}'] = 0
+        rem_sum = sum(target.get(f'weight_{m}', 0) for m in active)
+        if rem_sum > 0:
+            allocated = 0
+            for m in active[:-1]:
+                w = int(round(target.get(f'weight_{m}', 0) * 100 / rem_sum))
+                target[f'weight_{m}'] = w
+                allocated += w
+            target[f'weight_{active[-1]}'] = 100 - allocated
+        else:
+            each = 100 // len(active)
+            allocated = 0
+            for m in active[:-1]:
+                target[f'weight_{m}'] = each
+                allocated += each
+            target[f'weight_{active[-1]}'] = 100 - allocated
+    else:
+        target_val = 100 // len(active)
+        others = [m for m in active if m != toggled_key]
+        target[f'weight_{toggled_key}'] = target_val
+        rem_budget = 100 - target_val
+        old_sum = sum(target.get(f'weight_{m}', 0) for m in others)
+        if old_sum > 0:
+            allocated = 0
+            for m in others[:-1]:
+                w = int(round(target.get(f'weight_{m}', 0) * rem_budget / old_sum))
+                target[f'weight_{m}'] = w
+                allocated += w
+            target[f'weight_{others[-1]}'] = rem_budget - allocated
+        else:
+            each = rem_budget // len(others)
+            allocated = 0
+            for m in others[:-1]:
+                target[f'weight_{m}'] = each
+                allocated += each
+            target[f'weight_{others[-1]}'] = rem_budget - allocated
+
+
 # ==================== KHỞI TẠO STATE BỀN VỮNG TRONG RAM ====================
 if "query_type" not in st.session_state:
     st.session_state.query_type = "🎯 Textual KIS (Nhiều giai đoạn)"
@@ -150,8 +251,9 @@ if "kis_stages" not in st.session_state:
         {
             "top_k": 100,
             "use_clip": True, "weight_clip": 100, "query_clip": "",
-            "use_od": False, "weight_od": 50, "query_od": "",
-            "use_ocr": False, "weight_ocr": 50, "query_ocr": ""
+            "use_od": False, "weight_od": 0, "query_od": "",
+            "use_ocr": False, "weight_ocr": 0, "query_ocr": "",
+            "use_asr": False, "weight_asr": 0, "query_asr": "", "padding_asr": 15
         }
     ]
 
@@ -162,13 +264,15 @@ if "trake_events" not in st.session_state:
     st.session_state.trake_events = [
         {
             "use_clip": True, "weight_clip": 100, "query_clip": "",
-            "use_od": False, "weight_od": 50, "query_od": "",
-            "use_ocr": False, "weight_ocr": 50, "query_ocr": ""
+            "use_od": False, "weight_od": 0, "query_od": "",
+            "use_ocr": False, "weight_ocr": 0, "query_ocr": "",
+            "use_asr": False, "weight_asr": 0, "query_asr": "", "padding_asr": 15
         },
         {
             "use_clip": True, "weight_clip": 100, "query_clip": "",
-            "use_od": False, "weight_od": 50, "query_od": "",
-            "use_ocr": False, "weight_ocr": 50, "query_ocr": ""
+            "use_od": False, "weight_od": 0, "query_od": "",
+            "use_ocr": False, "weight_ocr": 0, "query_ocr": "",
+            "use_asr": False, "weight_asr": 0, "query_asr": "", "padding_asr": 15
         }
     ]
 
@@ -210,8 +314,9 @@ def add_kis_stage():
     st.session_state.kis_stages.append({
         "top_k": 10,
         "use_clip": True, "weight_clip": 100, "query_clip": "",
-        "use_od": True, "weight_od": 50, "query_od": "",
-        "use_ocr": False, "weight_ocr": 50, "query_ocr": ""
+        "use_od": False, "weight_od": 0, "query_od": "",
+        "use_ocr": False, "weight_ocr": 0, "query_ocr": "",
+        "use_asr": False, "weight_asr": 0, "query_asr": "", "padding_asr": 15
     })
     st.session_state.active_kis_stage_idx = len(st.session_state.kis_stages) - 1
 
@@ -227,8 +332,9 @@ def set_active_trake_event(idx):
 def add_trake_event():
     st.session_state.trake_events.append({
         "use_clip": True, "weight_clip": 100, "query_clip": "",
-        "use_od": False, "weight_od": 50, "query_od": "",
-        "use_ocr": False, "weight_ocr": 50, "query_ocr": ""
+        "use_od": False, "weight_od": 0, "query_od": "",
+        "use_ocr": False, "weight_ocr": 0, "query_ocr": "",
+        "use_asr": False, "weight_asr": 0, "query_asr": "", "padding_asr": 15
     })
     st.session_state.active_trake_event_idx = len(st.session_state.trake_events) - 1
 
@@ -243,6 +349,37 @@ def play_video_callback(video_id, frame_id, start_sec):
 
 def close_video_callback():
     st.session_state.active_video = None
+
+
+# Callbacks tự động cân bằng trọng số KIS
+def on_kis_toggle(s_idx, model):
+    stg = st.session_state.kis_stages[s_idx]
+    is_checked = st.session_state.get(f"c3_chk_{model}_{s_idx}", False)
+    rebalance_weights_on_toggle(stg, model, is_checked)
+    for m in ['clip', 'od', 'ocr', 'asr']:
+        st.session_state[f"c3_w_{m}_{s_idx}"] = stg[f"weight_{m}"]
+
+def on_kis_weight_change(s_idx, model):
+    stg = st.session_state.kis_stages[s_idx]
+    new_val = st.session_state.get(f"c3_w_{model}_{s_idx}", 0)
+    rebalance_weights_on_change(stg, model, new_val)
+    for m in ['clip', 'od', 'ocr', 'asr']:
+        st.session_state[f"c3_w_{m}_{s_idx}"] = stg[f"weight_{m}"]
+
+# Callbacks tự động cân bằng trọng số TRAKE
+def on_trake_toggle(e_idx, model):
+    ev = st.session_state.trake_events[e_idx]
+    is_checked = st.session_state.get(f"c3_tr_chk_{model}_{e_idx}", False)
+    rebalance_weights_on_toggle(ev, model, is_checked)
+    for m in ['clip', 'od', 'ocr', 'asr']:
+        st.session_state[f"c3_tr_w_{m}_{e_idx}"] = ev[f"weight_{m}"]
+
+def on_trake_weight_change(e_idx, model):
+    ev = st.session_state.trake_events[e_idx]
+    new_val = st.session_state.get(f"c3_tr_w_{model}_{e_idx}", 0)
+    rebalance_weights_on_change(ev, model, new_val)
+    for m in ['clip', 'od', 'ocr', 'asr']:
+        st.session_state[f"c3_tr_w_{m}_{e_idx}"] = ev[f"weight_{m}"]
 
 
 # =========================================================
@@ -299,34 +436,42 @@ def render_controls():
                 stages_payload = []
                 valid = True
                 for idx, stg in enumerate(st.session_state.kis_stages):
-                    w_c = stg["weight_clip"] if stg["use_clip"] else 0
-                    q_c = stg["query_clip"].strip()
-                    w_d = stg["weight_od"] if stg["use_od"] else 0
-                    q_d = stg["query_od"].strip()
-                    w_r = stg["weight_ocr"] if stg["use_ocr"] else 0
-                    q_r = stg["query_ocr"].strip()
+                    w_c = stg.get("weight_clip", 0) if stg.get("use_clip", False) else 0
+                    q_c = stg.get("query_clip", "").strip()
+                    
+                    w_d = stg.get("weight_od", 0) if stg.get("use_od", False) else 0
+                    q_d = stg.get("query_od", "").strip()
+                    
+                    w_r = stg.get("weight_ocr", 0) if stg.get("use_ocr", False) else 0
+                    q_r = stg.get("query_ocr", "").strip()
 
-                    w_tot = w_c + w_d + w_r
+                    w_a = stg.get("weight_asr", 0) if stg.get("use_asr", False) else 0
+                    q_a = stg.get("query_asr", "").strip()
+                    pad_a = float(stg.get("padding_asr", 15))
+
+                    w_tot = w_c + w_d + w_r + w_a
                     if w_tot == 0:
-                        st.error(f"Giai đoạn {idx+1}: Tổng trọng số phải > 0!")
+                        st.error(f"Giai đoạn {idx+1}: Hãy chọn ít nhất 1 model có trọng số > 0%!")
                         valid = False
                         break
 
                     modules = {}
-                    if stg["use_clip"] and q_c:
+                    if stg.get("use_clip") and q_c and w_c > 0:
                         modules["clip"] = {"weight": w_c / w_tot, "text_query": q_c}
-                    if stg["use_od"] and q_d:
+                    if stg.get("use_od") and q_d and w_d > 0:
                         objs = [x.strip() for x in q_d.split(",") if x.strip()]
                         modules["od"] = {"weight": w_d / w_tot, "query_objects": objs}
-                    if stg["use_ocr"] and q_r:
+                    if stg.get("use_ocr") and q_r and w_r > 0:
                         modules["ocr"] = {"weight": w_r / w_tot, "text_query": q_r}
+                    if stg.get("use_asr") and q_a and w_a > 0:
+                        modules["asr"] = {"weight": w_a / w_tot, "text_query": q_a, "padding_sec": pad_a}
 
                     if not modules:
-                        st.error(f"Giai đoạn {idx+1}: Hãy nhập ít nhất 1 nội dung tìm kiếm (CLIP / OD / OCR)!")
+                        st.error(f"Giai đoạn {idx+1}: Hãy nhập nội dung tìm kiếm cho các model đang bật!")
                         valid = False
                         break
 
-                    stages_payload.append({"modules": modules, "top_k": int(stg["top_k"])})
+                    stages_payload.append({"modules": modules, "top_k": int(stg.get("top_k", 100))})
 
                 if valid:
                     with st.spinner("🚀 Đang chạy tìm kiếm KIS..."):
@@ -375,30 +520,38 @@ def render_controls():
                 events_payload = []
                 valid = True
                 for idx, ev in enumerate(st.session_state.trake_events):
-                    w_c = ev["weight_clip"] if ev["use_clip"] else 0
-                    q_c = ev["query_clip"].strip()
-                    w_d = ev["weight_od"] if ev["use_od"] else 0
-                    q_d = ev["query_od"].strip()
-                    w_r = ev["weight_ocr"] if ev["use_ocr"] else 0
-                    q_r = ev["query_ocr"].strip()
+                    w_c = ev.get("weight_clip", 0) if ev.get("use_clip", False) else 0
+                    q_c = ev.get("query_clip", "").strip()
+                    
+                    w_d = ev.get("weight_od", 0) if ev.get("use_od", False) else 0
+                    q_d = ev.get("query_od", "").strip()
+                    
+                    w_r = ev.get("weight_ocr", 0) if ev.get("use_ocr", False) else 0
+                    q_r = ev.get("query_ocr", "").strip()
 
-                    w_tot = w_c + w_d + w_r
+                    w_a = ev.get("weight_asr", 0) if ev.get("use_asr", False) else 0
+                    q_a = ev.get("query_asr", "").strip()
+                    pad_a = float(ev.get("padding_asr", 15))
+
+                    w_tot = w_c + w_d + w_r + w_a
                     if w_tot == 0:
-                        st.error(f"Event {idx+1}: Tổng trọng số phải > 0!")
+                        st.error(f"Event {idx+1}: Hãy chọn ít nhất 1 model có trọng số > 0%!")
                         valid = False
                         break
 
                     modules = {}
-                    if ev["use_clip"] and q_c:
+                    if ev.get("use_clip") and q_c and w_c > 0:
                         modules["clip"] = {"weight": w_c / w_tot, "text_query": q_c}
-                    if ev["use_od"] and q_d:
+                    if ev.get("use_od") and q_d and w_d > 0:
                         objs = [x.strip() for x in q_d.split(",") if x.strip()]
                         modules["od"] = {"weight": w_d / w_tot, "query_objects": objs}
-                    if ev["use_ocr"] and q_r:
+                    if ev.get("use_ocr") and q_r and w_r > 0:
                         modules["ocr"] = {"weight": w_r / w_tot, "text_query": q_r}
+                    if ev.get("use_asr") and q_a and w_a > 0:
+                        modules["asr"] = {"weight": w_a / w_tot, "text_query": q_a, "padding_sec": pad_a}
 
                     if not modules:
-                        st.error(f"Event {idx+1}: Hãy nhập ít nhất 1 nội dung tìm kiếm!")
+                        st.error(f"Event {idx+1}: Hãy nhập nội dung tìm kiếm cho các model đang bật!")
                         valid = False
                         break
 
@@ -419,11 +572,21 @@ def render_controls():
                             st.rerun(scope="app") if hasattr(st.rerun, "__code__") and "scope" in st.rerun.__code__.co_varnames else st.rerun()
 
         st.divider()
-        if st.button("♻️ Nạp lại Cache", use_container_width=True):
-            st.cache_resource.clear()
-            st.cache_data.clear()
-            _VIDEO_PATH_CACHE.clear()
-            st.rerun()
+        c_act1, c_act2 = st.columns(2)
+        with c_act1:
+            if st.button("♻️ Nạp lại Cache", use_container_width=True):
+                st.cache_resource.clear()
+                st.cache_data.clear()
+                _VIDEO_PATH_CACHE.clear()
+                st.rerun()
+        with c_act2:
+            if st.button("⚡ Index ASR", use_container_width=True):
+                with st.spinner("Đang lập chỉ mục ASR..."):
+                    pre = ASRPreprocessor()
+                    pre.process_all()
+                    st.success("✅ Đã tạo chỉ mục ASR Index!")
+                    st.cache_resource.clear()
+                    st.rerun()
 
     # -----------------------------------------------------
     # CỘT 3: CHỈNH CHI TIẾT GIAI ĐOẠN / EVENT ĐANG CHỌN
@@ -442,41 +605,106 @@ def render_controls():
                 f"Top K giữ lại chuyển sang Giai đoạn sau:",
                 min_value=1,
                 max_value=5000,
-                value=int(stg["top_k"]),
+                value=int(stg.get("top_k", 100)),
                 key=f"c3_kis_topk_{curr_idx}"
             )
             stg["top_k"] = top_k_val
 
-            st.markdown("**Chọn models & Phân bổ trọng số (%):**")
+            st.markdown("**Chọn models & Phân bổ trọng số (Tổng = 100%):**")
             
-            stg["use_clip"] = st.checkbox("Mô hình CLIP (Text-Image)", value=stg["use_clip"], key=f"c3_chk_c_{curr_idx}")
-            if stg["use_clip"]:
-                stg["weight_clip"] = st.slider("Trọng số CLIP (%)", 0, 100, value=int(stg["weight_clip"]), key=f"c3_wc_{curr_idx}")
-                stg["query_clip"] = st.text_area("CLIP Prompt / Query:", value=stg["query_clip"], height=65, key=f"c3_qc_{curr_idx}")
+            # Đồng bộ state widget
+            for m in ['clip', 'od', 'ocr', 'asr']:
+                if f"c3_chk_{m}_{curr_idx}" not in st.session_state:
+                    st.session_state[f"c3_chk_{m}_{curr_idx}"] = stg.get(f"use_{m}", False)
+                if f"c3_w_{m}_{curr_idx}" not in st.session_state:
+                    st.session_state[f"c3_w_{m}_{curr_idx}"] = int(stg.get(f"weight_{m}", 0))
+
+            # 1. CLIP
+            use_c = st.checkbox(
+                "Mô hình CLIP (Text-Image)",
+                key=f"c3_chk_clip_{curr_idx}",
+                on_change=on_kis_toggle,
+                args=(curr_idx, "clip")
+            )
+            if use_c:
+                st.slider(
+                    "Trọng số CLIP (%)", 0, 100,
+                    key=f"c3_w_clip_{curr_idx}",
+                    on_change=on_kis_weight_change,
+                    args=(curr_idx, "clip")
+                )
+                stg["query_clip"] = st.text_area("CLIP Prompt / Query:", value=stg.get("query_clip", ""), height=65, key=f"c3_qc_{curr_idx}")
             
             st.divider()
-            stg["use_od"] = st.checkbox("Mô hình Object Detection (OD)", value=stg["use_od"], key=f"c3_chk_d_{curr_idx}")
-            if stg["use_od"]:
-                stg["weight_od"] = st.slider("Trọng số OD (%)", 0, 100, value=int(stg["weight_od"]), key=f"c3_wd_{curr_idx}")
-                stg["query_od"] = st.text_input("Vật thể (cách nhau dấu phẩy):", value=stg["query_od"], key=f"c3_qd_{curr_idx}")
+            # 2. OD
+            use_d = st.checkbox(
+                "Mô hình Object Detection (OD)",
+                key=f"c3_chk_od_{curr_idx}",
+                on_change=on_kis_toggle,
+                args=(curr_idx, "od")
+            )
+            if use_d:
+                st.slider(
+                    "Trọng số OD (%)", 0, 100,
+                    key=f"c3_w_od_{curr_idx}",
+                    on_change=on_kis_weight_change,
+                    args=(curr_idx, "od")
+                )
+                stg["query_od"] = st.text_input("Vật thể (cách nhau dấu phẩy):", value=stg.get("query_od", ""), key=f"c3_qd_{curr_idx}")
 
             st.divider()
-            stg["use_ocr"] = st.checkbox("Mô hình OCR (Text in frame)", value=stg["use_ocr"], key=f"c3_chk_r_{curr_idx}")
-            if stg["use_ocr"]:
-                stg["weight_ocr"] = st.slider("Trọng số OCR (%)", 0, 100, value=int(stg["weight_ocr"]), key=f"c3_wr_{curr_idx}")
-                stg["query_ocr"] = st.text_input("Chữ cần tìm:", value=stg["query_ocr"], key=f"c3_qr_{curr_idx}")
+            # 3. OCR
+            use_r = st.checkbox(
+                "Mô hình OCR (Text in frame)",
+                key=f"c3_chk_ocr_{curr_idx}",
+                on_change=on_kis_toggle,
+                args=(curr_idx, "ocr")
+            )
+            if use_r:
+                st.slider(
+                    "Trọng số OCR (%)", 0, 100,
+                    key=f"c3_w_ocr_{curr_idx}",
+                    on_change=on_kis_weight_change,
+                    args=(curr_idx, "ocr")
+                )
+                stg["query_ocr"] = st.text_input("Chữ cần tìm trên hình:", value=stg.get("query_ocr", ""), key=f"c3_qr_{curr_idx}")
 
-            w_c = stg["weight_clip"] if stg["use_clip"] else 0
-            w_d = stg["weight_od"] if stg["use_od"] else 0
-            w_r = stg["weight_ocr"] if stg["use_ocr"] else 0
-            w_tot = w_c + w_d + w_r
+            st.divider()
+            # 4. ASR
+            use_a = st.checkbox(
+                "Mô hình ASR (Speech Transcript)",
+                key=f"c3_chk_asr_{curr_idx}",
+                on_change=on_kis_toggle,
+                args=(curr_idx, "asr")
+            )
+            if use_a:
+                st.slider(
+                    "Trọng số ASR (%)", 0, 100,
+                    key=f"c3_w_asr_{curr_idx}",
+                    on_change=on_kis_weight_change,
+                    args=(curr_idx, "asr")
+                )
+                stg["query_asr"] = st.text_input("Lời thoại / Giọng nói (ASR):", value=stg.get("query_asr", ""), key=f"c3_qa_{curr_idx}")
+                stg["padding_asr"] = st.slider("Phạm vi mở rộng (± giây):", 0, 60, value=int(stg.get("padding_asr", 15)), key=f"c3_pa_{curr_idx}")
+
+            w_c = stg.get("weight_clip", 0) if stg.get("use_clip") else 0
+            w_d = stg.get("weight_od", 0) if stg.get("use_od") else 0
+            w_r = stg.get("weight_ocr", 0) if stg.get("use_ocr") else 0
+            w_a = stg.get("weight_asr", 0) if stg.get("use_asr") else 0
+            w_tot = w_c + w_d + w_r + w_a
             if w_tot > 0:
-                cn = (w_c / w_tot * 100)
-                dn = (w_d / w_tot * 100)
-                rn = (w_r / w_tot * 100)
-                st.info(f"✨ Tỷ lệ: **CLIP ({cn:.0f}%) | OD ({dn:.0f}%) | OCR ({rn:.0f}%)**")
+                parts = []
+                if stg.get("use_clip") and w_c > 0:
+                    parts.append(f"CLIP ({w_c}%)")
+                if stg.get("use_od") and w_d > 0:
+                    parts.append(f"OD ({w_d}%)")
+                if stg.get("use_ocr") and w_r > 0:
+                    parts.append(f"OCR ({w_r}%)")
+                if stg.get("use_asr") and w_a > 0:
+                    parts.append(f"ASR ({w_a}%)")
+                st.info(f"✨ Tỷ lệ: **{' | '.join(parts)}** (Tổng: **{w_tot}%**)")
             else:
-                st.warning("⚠️ Bật ít nhất 1 model có trọng số > 0")
+                st.warning("⚠️ Hãy bật ít nhất 1 model để tìm kiếm")
 
         else:
             curr_idx = st.session_state.active_trake_event_idx
@@ -487,34 +715,98 @@ def render_controls():
             ev = st.session_state.trake_events[curr_idx]
             st.markdown(f"<div class='panel-title'>🛠️ CỘT 3: CHI TIẾT EVENT {curr_idx + 1}</div>", unsafe_allow_html=True)
 
-            ev["use_clip"] = st.checkbox("Mô hình CLIP (Text-Image)", value=ev["use_clip"], key=f"c3_tr_chk_c_{curr_idx}")
-            if ev["use_clip"]:
-                ev["weight_clip"] = st.slider("Trọng số CLIP (%)", 0, 100, value=int(ev["weight_clip"]), key=f"c3_tr_wc_{curr_idx}")
-                ev["query_clip"] = st.text_area("Mô tả sự kiện (CLIP Query):", value=ev["query_clip"], height=65, key=f"c3_tr_qc_{curr_idx}")
+            for m in ['clip', 'od', 'ocr', 'asr']:
+                if f"c3_tr_chk_{m}_{curr_idx}" not in st.session_state:
+                    st.session_state[f"c3_tr_chk_{m}_{curr_idx}"] = ev.get(f"use_{m}", False)
+                if f"c3_tr_w_{m}_{curr_idx}" not in st.session_state:
+                    st.session_state[f"c3_tr_w_{m}_{curr_idx}"] = int(ev.get(f"weight_{m}", 0))
+
+            # 1. CLIP
+            use_c = st.checkbox(
+                "Mô hình CLIP (Text-Image)",
+                key=f"c3_tr_chk_clip_{curr_idx}",
+                on_change=on_trake_toggle,
+                args=(curr_idx, "clip")
+            )
+            if use_c:
+                st.slider(
+                    "Trọng số CLIP (%)", 0, 100,
+                    key=f"c3_tr_w_clip_{curr_idx}",
+                    on_change=on_trake_weight_change,
+                    args=(curr_idx, "clip")
+                )
+                ev["query_clip"] = st.text_area("Mô tả sự kiện (CLIP Query):", value=ev.get("query_clip", ""), height=65, key=f"c3_tr_qc_{curr_idx}")
 
             st.divider()
-            ev["use_od"] = st.checkbox("Mô hình Object Detection (OD)", value=ev["use_od"], key=f"c3_tr_chk_d_{curr_idx}")
-            if ev["use_od"]:
-                ev["weight_od"] = st.slider("Trọng số OD (%)", 0, 100, value=int(ev["weight_od"]), key=f"c3_tr_wd_{curr_idx}")
-                ev["query_od"] = st.text_input("Vật thể xuất hiện:", value=ev["query_od"], key=f"c3_tr_qd_{curr_idx}")
+            # 2. OD
+            use_d = st.checkbox(
+                "Mô hình Object Detection (OD)",
+                key=f"c3_tr_chk_od_{curr_idx}",
+                on_change=on_trake_toggle,
+                args=(curr_idx, "od")
+            )
+            if use_d:
+                st.slider(
+                    "Trọng số OD (%)", 0, 100,
+                    key=f"c3_tr_w_od_{curr_idx}",
+                    on_change=on_trake_weight_change,
+                    args=(curr_idx, "od")
+                )
+                ev["query_od"] = st.text_input("Vật thể xuất hiện:", value=ev.get("query_od", ""), key=f"c3_tr_qd_{curr_idx}")
 
             st.divider()
-            ev["use_ocr"] = st.checkbox("Mô hình OCR (Text in frame)", value=ev["use_ocr"], key=f"c3_tr_chk_r_{curr_idx}")
-            if ev["use_ocr"]:
-                ev["weight_ocr"] = st.slider("Trọng số OCR (%)", 0, 100, value=int(ev["weight_ocr"]), key=f"c3_tr_wr_{curr_idx}")
-                ev["query_ocr"] = st.text_input("Chữ cần tìm:", value=ev["query_ocr"], key=f"c3_tr_qr_{curr_idx}")
+            # 3. OCR
+            use_r = st.checkbox(
+                "Mô hình OCR (Text in frame)",
+                key=f"c3_tr_chk_ocr_{curr_idx}",
+                on_change=on_trake_toggle,
+                args=(curr_idx, "ocr")
+            )
+            if use_r:
+                st.slider(
+                    "Trọng số OCR (%)", 0, 100,
+                    key=f"c3_tr_w_ocr_{curr_idx}",
+                    on_change=on_trake_weight_change,
+                    args=(curr_idx, "ocr")
+                )
+                ev["query_ocr"] = st.text_input("Chữ cần tìm trên hình:", value=ev.get("query_ocr", ""), key=f"c3_tr_qr_{curr_idx}")
 
-            w_c = ev["weight_clip"] if ev["use_clip"] else 0
-            w_d = ev["weight_od"] if ev["use_od"] else 0
-            w_r = ev["weight_ocr"] if ev["use_ocr"] else 0
-            w_tot = w_c + w_d + w_r
+            st.divider()
+            # 4. ASR
+            use_a = st.checkbox(
+                "Mô hình ASR (Speech Transcript)",
+                key=f"c3_tr_chk_asr_{curr_idx}",
+                on_change=on_trake_toggle,
+                args=(curr_idx, "asr")
+            )
+            if use_a:
+                st.slider(
+                    "Trọng số ASR (%)", 0, 100,
+                    key=f"c3_tr_w_asr_{curr_idx}",
+                    on_change=on_trake_weight_change,
+                    args=(curr_idx, "asr")
+                )
+                ev["query_asr"] = st.text_input("Lời thoại / Giọng nói (ASR):", value=ev.get("query_asr", ""), key=f"c3_tr_qa_{curr_idx}")
+                ev["padding_asr"] = st.slider("Phạm vi mở rộng (± giây):", 0, 60, value=int(ev.get("padding_asr", 15)), key=f"c3_tr_pa_{curr_idx}")
+
+            w_c = ev.get("weight_clip", 0) if ev.get("use_clip") else 0
+            w_d = ev.get("weight_od", 0) if ev.get("use_od") else 0
+            w_r = ev.get("weight_ocr", 0) if ev.get("use_ocr") else 0
+            w_a = ev.get("weight_asr", 0) if ev.get("use_asr") else 0
+            w_tot = w_c + w_d + w_r + w_a
             if w_tot > 0:
-                cn = (w_c / w_tot * 100)
-                dn = (w_d / w_tot * 100)
-                rn = (w_r / w_tot * 100)
-                st.info(f"✨ Tỷ lệ: **CLIP ({cn:.0f}%) | OD ({dn:.0f}%) | OCR ({rn:.0f}%)**")
+                parts = []
+                if ev.get("use_clip") and w_c > 0:
+                    parts.append(f"CLIP ({w_c}%)")
+                if ev.get("use_od") and w_d > 0:
+                    parts.append(f"OD ({w_d}%)")
+                if ev.get("use_ocr") and w_r > 0:
+                    parts.append(f"OCR ({w_r}%)")
+                if ev.get("use_asr") and w_a > 0:
+                    parts.append(f"ASR ({w_a}%)")
+                st.info(f"✨ Tỷ lệ: **{' | '.join(parts)}** (Tổng: **{w_tot}%**)")
             else:
-                st.warning("⚠️ Bật ít nhất 1 model có trọng số > 0")
+                st.warning("⚠️ Hãy bật ít nhất 1 model để tìm kiếm")
 
 # Render Fragment Cột 1 & Cột 3
 render_controls()
@@ -526,23 +818,24 @@ render_controls()
 @safe_fragment
 def render_gallery_panel():
     with col_mid_main:
-        st.markdown("<div class='panel-title'>🎬 CỘT 2: MULTIMEDIA GALLERY & PLAYER</div>", unsafe_allow_html=True)
+        st.markdown("<div class='panel-title'>🎬 CỘT 2: VITRIVR MULTIMEDIA GALLERY & PLAYER</div>", unsafe_allow_html=True)
         
         # 1. Trình phát Video Player
         if st.session_state.active_video is not None:
             v_info = st.session_state.active_video
             v_path = get_video_path(v_info["video_id"])
+            kf_info = mapper.get_info(v_info["video_id"], v_info["frame_id"])
             
             c_title, c_close = st.columns([8, 2])
             with c_title:
-                st.markdown(f"**🎞️ Đang phát:** `{v_info['video_id']}` | **Frame:** `{v_info['frame_id']}` (~`{v_info['start_sec']}s`)")
+                st.markdown(f"**🎞️ Đang phát:** `{v_info['video_id']}` | **Keyframe:** `{kf_info['n']}` | **Frame Index:** `{kf_info['frame_idx']}` | **Time:** `{kf_info['pts_time']:.2f}s`")
             with c_close:
                 st.button("❌ Đóng Video", key="btn_close_v", on_click=close_video_callback, use_container_width=True)
 
             if v_path and os.path.exists(v_path):
-                st.video(v_path, start_time=int(v_info["start_sec"]), autoplay=True)
+                st.video(v_path, start_time=int(kf_info["pts_time"]), autoplay=True)
             else:
-                st.warning(f"⚠️ Chưa tìm thấy file video `{v_info['video_id']}.mp4` trong `data/videos`. Khi bạn copy video vào thư mục này, video sẽ tự động phát từ Frame {v_info['frame_id']} ({v_info['start_sec']}s)!")
+                st.warning(f"⚠️ Chưa tìm thấy file video `{v_info['video_id']}.mp4` trong `data/videos`. Khi bạn copy video vào thư mục này, video sẽ tự động phát từ mốc `{kf_info['pts_time']:.2f}s` (Frame {kf_info['frame_idx']})!")
                 
             st.divider()
 
@@ -576,6 +869,12 @@ def render_gallery_panel():
                 if res.get("status") == "success":
                     results = res.get("results", [])
                     st.success(f"🎯 Tìm thấy {len(results)} kết quả KIS (Click vào ảnh để xem video):")
+                    
+                    # Nút hiển thị chuỗi nộp bài thi AIC
+                    with st.expander("📋 Xem danh sách ID nộp bài thi (DRES / VBS Format)"):
+                        sub_lines = [mapper.format_submission_line(item['video_id'], item['frame_id'], mode="frame_idx") for item in results]
+                        st.code("\n".join(sub_lines), language="text")
+
                     for i in range(0, len(results), 3):
                         cols = st.columns(3)
                         for j in range(3):
@@ -584,14 +883,16 @@ def render_gallery_panel():
                                 item = results[idx]
                                 with cols[j]:
                                     img_url = get_image_url(item['video_id'], item['frame_id'])
-                                    start_sec = int(item['frame_id'] / 25)
+                                    kf_info = mapper.get_info(item['video_id'], item['frame_id'])
+                                    start_sec = int(kf_info['pts_time'])
                                     score_pct = item['score'] * 100
                                     
                                     st.markdown(
                                         f"<div class='vitrivr-card' onclick=\"const b=this.parentElement.querySelector('button'); if(b) b.click();\">"
                                         f"<div class='score-badge'>{score_pct:.1f}%</div>"
                                         f"<img src='{img_url}' class='card-img' onerror=\"this.onerror=null; this.src='https://placehold.co/240x135?text=F+{item['frame_id']}';\" />"
-                                        f"<span class='meta-tag'><b>{item['video_id']}</b> | Frame {item['frame_id']}</span>"
+                                        f"<span class='meta-tag-primary'><b>{item['video_id']}</b> | KF {kf_info['n']}</span>"
+                                        f"<span class='meta-tag-secondary'>Frame {kf_info['frame_idx']} ({kf_info['pts_time']:.1f}s)</span>"
                                         f"</div>",
                                         unsafe_allow_html=True
                                     )
@@ -616,11 +917,13 @@ def render_gallery_panel():
                         for ev_idx, fid in enumerate(frames):
                             with ev_cols[ev_idx]:
                                 img_url = get_image_url(item['video_id'], fid)
-                                start_sec = int(fid / 25)
+                                kf_info = mapper.get_info(item['video_id'], fid)
+                                start_sec = int(kf_info['pts_time'])
                                 st.markdown(
                                     f"<div class='vitrivr-card' onclick=\"const b=this.parentElement.querySelector('button'); if(b) b.click();\">"
                                     f"<img src='{img_url}' class='card-img' onerror=\"this.onerror=null; this.src='https://placehold.co/240x135?text=F+{fid}';\" />"
-                                    f"<span class='meta-tag'>Event {ev_idx+1} | Frame {fid}</span>"
+                                    f"<span class='meta-tag-primary'>Event {ev_idx+1} | KF {kf_info['n']}</span>"
+                                    f"<span class='meta-tag-secondary'>Frame {kf_info['frame_idx']} ({kf_info['pts_time']:.1f}s)</span>"
                                     f"</div>",
                                     unsafe_allow_html=True
                                 )
@@ -633,14 +936,15 @@ def render_gallery_panel():
 
                         item_vid = item["video_id"]
                         first_f = frames[0]
+                        first_info = mapper.get_info(item_vid, first_f)
                         last_f = frames[-1]
-                        start_first_sec = int(first_f / 25)
+                        last_info = mapper.get_info(item_vid, last_f)
                         st.button(
-                            f"🎬 Chiếu toàn bộ sự kiện (F{first_f} ➔ F{last_f})",
+                            f"🎬 Chiếu toàn bộ sự kiện (KF {first_info['n']} ➔ KF {last_info['n']} / {first_info['pts_time']:.1f}s - {last_info['pts_time']:.1f}s)",
                             key=f"p_all_{item_vid}_{rank_idx}",
                             use_container_width=True,
                             on_click=play_video_callback,
-                            args=(item_vid, first_f, start_first_sec)
+                            args=(item_vid, first_f, int(first_info['pts_time']))
                         )
                         st.divider()
                 else:
@@ -696,12 +1000,14 @@ def render_gallery_panel():
                         vid_id, fid = current_page_items[idx]
                         with cols[j]:
                             img_url = get_image_url(vid_id, fid)
-                            start_sec = int(fid / 25)
+                            kf_info = mapper.get_info(vid_id, fid)
+                            start_sec = int(kf_info['pts_time'])
                             
                             st.markdown(
                                 f"<div class='vitrivr-card' onclick=\"const b=this.parentElement.querySelector('button'); if(b) b.click();\">"
                                 f"<img src='{img_url}' class='card-img' onerror=\"this.onerror=null; this.src='https://placehold.co/240x135?text=F+{fid}';\" />"
-                                f"<span class='meta-tag'><b>{vid_id}</b> | Frame {fid}</span>"
+                                f"<span class='meta-tag-primary'><b>{vid_id}</b> | KF {kf_info['n']}</span>"
+                                f"<span class='meta-tag-secondary'>Frame {kf_info['frame_idx']} ({kf_info['pts_time']:.1f}s)</span>"
                                 f"</div>",
                                 unsafe_allow_html=True
                             )
