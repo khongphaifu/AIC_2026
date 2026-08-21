@@ -40,7 +40,10 @@ def load_faiss_database():
             with open(CACHE_META_CLIP_PATH, "rb") as f:
                 data = pickle.load(f)
             print(f"[*] Đã nạp xong {index.ntotal} vector FAISS từ cache.")
-            return data["all_features"], data["metadata_clip"], index, data["key_to_faiss_id"]
+            # ⚡ OPTIMIZED: all_features không còn lưu trong pkl nữa
+            # Nếu cache cũ vẫn có all_features thì dùng, nếu không thì None
+            all_features = data.get("all_features", None)
+            return all_features, data["metadata_clip"], index, data["key_to_faiss_id"]
         except Exception as e:
             print(f"[!] Lỗi khi đọc cache FAISS ({e}), chuyển sang nạp thô từ .npy...")
 
@@ -80,13 +83,14 @@ def load_faiss_database():
             
         try:
             faiss.write_index(index, CACHE_FAISS_PATH)
+            # ⚡ OPTIMIZED: Không lưu all_features vào pkl (đã có trong FAISS index)
             with open(CACHE_META_CLIP_PATH, "wb") as f:
-                pickle.dump({"all_features": all_features, "metadata_clip": metadata_clip, "key_to_faiss_id": key_to_faiss_id}, f)
+                pickle.dump({"metadata_clip": metadata_clip, "key_to_faiss_id": key_to_faiss_id}, f)
             print(f"[*] Đã tự động tạo cache FAISS tại {CACHE_FAISS_PATH}")
         except Exception as e:
             print(f"[!] Không thể lưu cache FAISS: {e}")
     else:
-        all_features = np.asarray([], dtype="float32")
+        all_features = None
 
     return all_features, metadata_clip, index, key_to_faiss_id
 

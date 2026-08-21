@@ -8,7 +8,7 @@ from preprocess import mapper, ASRPreprocessor
 
 st.set_page_config(page_title="AIC 2026 Studio - vitrivr Style", page_icon="⚡", layout="wide")
 
-# CSS dark-mode vitrivr cao cấp & Thẻ ảnh click trực tiếp 100% sạch sẽ
+# CSS dark-mode vitrivr cao cấp & Thẻ ảnh click trực tiếp 100% sạch sẽ + GPU Acceleration
 st.markdown("""
 <style>
     .stApp { background-color: #0b0f19; color: #e6edf3; }
@@ -23,7 +23,7 @@ st.markdown("""
         gap: 6px;
     }
     
-    /* Thẻ Card vitrivr keyframe chuẩn gốc */
+    /* Thẻ Card vitrivr keyframe chuẩn gốc + GPU Acceleration */
     .vitrivr-card {
         background-color: #161b22;
         border: 1px solid #30363d;
@@ -31,13 +31,20 @@ st.markdown("""
         padding: 4px;
         text-align: center;
         margin-bottom: 8px;
-        transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
         cursor: pointer;
         user-select: none;
+        will-change: transform, box-shadow;
+        contain: layout style paint;
+        content-visibility: auto;
+        contain-intrinsic-size: auto 180px;
+        transform: translateZ(0);
+        transition: transform 0.15s cubic-bezier(0.4, 0, 0.2, 1),
+                    border-color 0.15s cubic-bezier(0.4, 0, 0.2, 1),
+                    box-shadow 0.15s cubic-bezier(0.4, 0, 0.2, 1);
     }
     .vitrivr-card:hover {
         border-color: #58a6ff;
-        transform: translateY(-3px);
+        transform: translateY(-3px) translateZ(0);
         box-shadow: 0 4px 14px rgba(88, 166, 255, 0.35);
     }
     .card-img {
@@ -85,6 +92,12 @@ st.markdown("""
     /* Ẩn hoàn toàn container của nút trigger ngầm dưới thẻ card */
     div[data-testid="stElementContainer"]:has(.vitrivr-card) + div[data-testid="stElementContainer"] {
         display: none !important;
+    }
+    
+    /* GPU acceleration cho video container */
+    div[data-testid="stVideo"] {
+        will-change: contents;
+        contain: layout;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -875,6 +888,21 @@ def render_gallery_panel():
                         sub_lines = [mapper.format_submission_line(item['video_id'], item['frame_id'], mode="frame_idx") for item in results]
                         st.code("\n".join(sub_lines), language="text")
 
+                    # Nút tải đáp án CSV (tối đa 100 dòng)
+                    kis_csv_lines = []
+                    for item in results[:100]:
+                        info = mapper.get_info(item['video_id'], item['frame_id'])
+                        kis_csv_lines.append(f"{info['video_id']},{info['frame_idx']}")
+                    kis_csv_data = "\n".join(kis_csv_lines)
+                    st.download_button(
+                        "📥 Tải đáp án CSV (KIS)",
+                        data=kis_csv_data,
+                        file_name="kis_submission.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="dl_kis_csv"
+                    )
+
                     for i in range(0, len(results), 3):
                         cols = st.columns(3)
                         for j in range(3):
@@ -890,7 +918,7 @@ def render_gallery_panel():
                                     st.markdown(
                                         f"<div class='vitrivr-card' onclick=\"const b=this.parentElement.querySelector('button'); if(b) b.click();\">"
                                         f"<div class='score-badge'>{score_pct:.1f}%</div>"
-                                        f"<img src='{img_url}' class='card-img' onerror=\"this.onerror=null; this.src='https://placehold.co/240x135?text=F+{item['frame_id']}';\" />"
+                                        f"<img src='{img_url}' class='card-img' loading='lazy' decoding='async' onerror=\"this.onerror=null; this.src='https://placehold.co/240x135?text=F+{item['frame_id']}';\" />"
                                         f"<span class='meta-tag-primary'><b>{item['video_id']}</b> | KF {kf_info['n']}</span>"
                                         f"<span class='meta-tag-secondary'>Frame {kf_info['frame_idx']} ({kf_info['pts_time']:.1f}s)</span>"
                                         f"</div>",
@@ -910,6 +938,21 @@ def render_gallery_panel():
                 if res.get("status") == "success":
                     results = res.get("results", [])
                     st.success(f"⏱️ Tìm thấy {len(results)} chuỗi TRAKE khớp nhất (Click vào ảnh để xem video):")
+
+                    # Nút tải đáp án CSV TRAKE (tối đa 100 dòng)
+                    trake_csv_lines = []
+                    for item in results[:100]:
+                        frame_idxs = [str(mapper.get_info(item['video_id'], fid)['frame_idx']) for fid in item['frames']]
+                        trake_csv_lines.append(f"{item['video_id']},{','.join(frame_idxs)}")
+                    trake_csv_data = "\n".join(trake_csv_lines)
+                    st.download_button(
+                        "📥 Tải đáp án CSV (TRAKE)",
+                        data=trake_csv_data,
+                        file_name="trake_submission.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="dl_trake_csv"
+                    )
                     for rank_idx, item in enumerate(results, 1):
                         st.markdown(f"**#{rank_idx} {item['video_id']}** (Score: `{item['score']:.4f}`)")
                         frames = item["frames"]
@@ -921,7 +964,7 @@ def render_gallery_panel():
                                 start_sec = int(kf_info['pts_time'])
                                 st.markdown(
                                     f"<div class='vitrivr-card' onclick=\"const b=this.parentElement.querySelector('button'); if(b) b.click();\">"
-                                    f"<img src='{img_url}' class='card-img' onerror=\"this.onerror=null; this.src='https://placehold.co/240x135?text=F+{fid}';\" />"
+                                    f"<img src='{img_url}' class='card-img' loading='lazy' decoding='async' onerror=\"this.onerror=null; this.src='https://placehold.co/240x135?text=F+{fid}';\" />"
                                     f"<span class='meta-tag-primary'>Event {ev_idx+1} | KF {kf_info['n']}</span>"
                                     f"<span class='meta-tag-secondary'>Frame {kf_info['frame_idx']} ({kf_info['pts_time']:.1f}s)</span>"
                                     f"</div>",
@@ -1005,7 +1048,7 @@ def render_gallery_panel():
                             
                             st.markdown(
                                 f"<div class='vitrivr-card' onclick=\"const b=this.parentElement.querySelector('button'); if(b) b.click();\">"
-                                f"<img src='{img_url}' class='card-img' onerror=\"this.onerror=null; this.src='https://placehold.co/240x135?text=F+{fid}';\" />"
+                                f"<img src='{img_url}' class='card-img' loading='lazy' decoding='async' onerror=\"this.onerror=null; this.src='https://placehold.co/240x135?text=F+{fid}';\" />"
                                 f"<span class='meta-tag-primary'><b>{vid_id}</b> | KF {kf_info['n']}</span>"
                                 f"<span class='meta-tag-secondary'>Frame {kf_info['frame_idx']} ({kf_info['pts_time']:.1f}s)</span>"
                                 f"</div>",

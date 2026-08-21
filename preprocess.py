@@ -31,6 +31,29 @@ CACHE_MAPPER_PATH = os.path.join(DATA_DIR, "cache_keyframe_mapper.pkl")
 CACHE_ASR_INDEX_PATH = os.path.join(DATA_DIR, "cache_asr_index.pkl")
 
 # =====================================================================
+# OD: Chỉ giữ top-K detections có score > ngưỡng (giảm ~412MB → ~80MB)
+# =====================================================================
+MAX_OD_DETECTIONS = 20
+MIN_OD_SCORE = 0.1
+
+# =====================================================================
+# ASR: Bộ lọc stop words tiếng Việt (giảm ~221MB → ~50MB)
+# =====================================================================
+VIETNAMESE_STOP_WORDS = frozenset({
+    'là', 'và', 'có', 'để', 'chúng', 'sẽ', 'thì', 'các', 'ta',
+    'của', 'được', 'trong', 'này', 'một', 'những', 'đã', 'cũng',
+    'với', 'không', 'cho', 'khi', 'còn', 'tôi', 'bạn', 'nó', 'đó',
+    'rất', 'từ', 'mà', 'nên', 'vì', 'hay', 'bị', 'như', 'ra',
+    'đi', 'lên', 'về', 'đây', 'lại', 'ở', 'qua', 'theo', 'tại',
+    'rồi', 'nhưng', 'thế', 'nào', 'mình', 'anh', 'em', 'ơi',
+    'nhé', 'ạ', 'à', 'ừ', 'uh', 'ah', 'oh', 'hả', 'hả',
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+    'of', 'to', 'in', 'for', 'on', 'with', 'at', 'by', 'it',
+    'that', 'this', 'and', 'or', 'but', 'not', 'you', 'we', 'he',
+    'she', 'they', 'i', 'me', 'my', 'your', 'his', 'her',
+})
+
+# =====================================================================
 # 1. HỆ THỐNG CHUYỂN ĐỔI ID VIDEO & KEYFRAME (THEO MAP-KEYFRAMES)
 # =====================================================================
 def _clean_video_id(raw_name):
@@ -228,12 +251,17 @@ def clean_asr_text(text):
     return txt
 
 def extract_keywords(text):
-    """Tách từ đơn và cụm từ liền kề (unigram + bigram) để lập chỉ mục tìm kiếm."""
+    """Tách từ đơn và cụm từ liền kề (unigram + bigram) để lập chỉ mục tìm kiếm.
+    Lọc bỏ Vietnamese stop words để giảm dung lượng index ~60%."""
     cleaned = clean_asr_text(text)
     words = cleaned.split()
-    tokens = set(words)
-    for i in range(len(words) - 1):
-        tokens.add(f"{words[i]} {words[i+1]}")
+    # Lọc stop words cho unigrams
+    tokens = set()
+    meaningful_words = [w for w in words if w not in VIETNAMESE_STOP_WORDS and len(w) > 1]
+    tokens.update(meaningful_words)
+    # Bigrams chỉ từ meaningful words
+    for i in range(len(meaningful_words) - 1):
+        tokens.add(f"{meaningful_words[i]} {meaningful_words[i+1]}")
     return tokens
 
 class ASRPreprocessor:
@@ -317,7 +345,8 @@ class ASRPreprocessor:
                         "inverted_index": self.inverted_index,
                         "cleaned_asr_data": self.cleaned_asr_data
                     }, f)
-                print(f"[*] Đã lưu cache ASR Inverted Index tại {CACHE_ASR_INDEX_PATH}")
+                size_mb = os.path.getsize(CACHE_ASR_INDEX_PATH) / 1024 / 1024
+                print(f"[*] Đã lưu cache ASR Inverted Index tại {CACHE_ASR_INDEX_PATH} ({size_mb:.1f} MB)")
             except Exception as e:
                 print(f"[!] Lỗi lưu cache ASR: {e}")
 
@@ -340,10 +369,10 @@ class ASRPreprocessor:
 # =====================================================================
 def build_all_caches():
     print("=" * 60)
-    print("🚀 BẮT ĐẦU TIỀN XỬ LÝ TOÀN BỘ DỮ LIỆU AIC 2026")
+    print("🚀 BẮT ĐẦU TIỀN XỬ LÝ TOÀN BỘ DỮ LIỆU AIC 2026 (OPTIMIZED)")
     print("=" * 60)
 
-    # 1. CLIP & FAISS
+    # 1. CLIP & FAISS — Tách features ra khỏi metadata pkl
     print("\n[1/5] Xây dựng FAISS Vector Index (HNSW)...")
     npy_files = sorted(glob.glob(os.path.join(CLIP_FEATURES_DIR, "*.npy")))
     all_features = []
@@ -363,6 +392,7 @@ def build_all_caches():
         all_features = np.asarray(all_features, dtype="float32")
         faiss.normalize_L2(all_features)
         dim = all_features.shape[1]
+
         index = faiss.IndexHNSWFlat(dim, HNSW_M, faiss.METRIC_INNER_PRODUCT)
         index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
         index.hnsw.efSearch = HNSW_EF_SEARCH
@@ -373,12 +403,20 @@ def build_all_caches():
             vkey = _clean_video_id(raw_name)
             key_to_faiss_id[(vkey, fid)] = internal_id
 
+        # ⚡ OPTIMIZED: Không lưu all_features vào pkl nữa (đã có trong FAISS index)
+        # Giảm từ ~353 MB xuống ~6 MB
         with open(CACHE_META_CLIP_PATH, "wb") as f:
-            pickle.dump({"all_features": all_features, "metadata_clip": metadata_clip, "key_to_faiss_id": key_to_faiss_id}, f)
-        print(f" -> Đã nén {index.ntotal:,} vector CLIP vào {CACHE_FAISS_PATH}")
+            pickle.dump({
+                "metadata_clip": metadata_clip,
+                "key_to_faiss_id": key_to_faiss_id
+            }, f)
+        
+        faiss_mb = os.path.getsize(CACHE_FAISS_PATH) / 1024 / 1024
+        clip_mb = os.path.getsize(CACHE_META_CLIP_PATH) / 1024 / 1024
+        print(f" -> Đã nén {index.ntotal:,} vector CLIP vào FAISS ({faiss_mb:.1f} MB) + metadata ({clip_mb:.1f} MB)")
 
-    # 2. Object Detection
-    print("\n[2/5] Gộp dữ liệu Object Detection JSON...")
+    # 2. Object Detection — Chỉ giữ top-K detections
+    print(f"\n[2/5] Gộp dữ liệu Object Detection JSON (top {MAX_OD_DETECTIONS}, score > {MIN_OD_SCORE})...")
     metadata_OD = []
     if Path(OBJECTS_DIR).exists():
         for video_dir in Path(OBJECTS_DIR).iterdir():
@@ -387,16 +425,34 @@ def build_all_caches():
                 try:
                     with open(json_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    metadata_OD.append({
-                        "video": video_dir.name,
-                        "frame_id": int(json_file.stem.split("_")[-1]),
-                        "scores": data.get("detection_scores", []),
-                        "classes": data.get("detection_class_entities", [])
-                    })
+                    
+                    raw_scores = data.get("detection_scores", [])
+                    raw_classes = data.get("detection_class_entities", [])
+                    
+                    # ⚡ OPTIMIZED: Chỉ giữ top-K detections có score > ngưỡng
+                    filtered_scores = []
+                    filtered_classes = []
+                    for sc, cl in zip(raw_scores, raw_classes):
+                        if float(sc) >= MIN_OD_SCORE:
+                            filtered_scores.append(round(float(sc), 3))
+                            filtered_classes.append(cl)
+                        if len(filtered_scores) >= MAX_OD_DETECTIONS:
+                            break
+                    
+                    # Chỉ lưu frame nếu có ít nhất 1 detection
+                    if filtered_scores:
+                        metadata_OD.append({
+                            "video": video_dir.name,
+                            "frame_id": int(json_file.stem.split("_")[-1]),
+                            "scores": filtered_scores,
+                            "classes": filtered_classes
+                        })
                 except Exception: pass
+    
     with open(CACHE_META_OD_PATH, "wb") as f:
         pickle.dump(metadata_OD, f)
-    print(f" -> Đã gộp {len(metadata_OD):,} frames OD vào {CACHE_META_OD_PATH}")
+    od_mb = os.path.getsize(CACHE_META_OD_PATH) / 1024 / 1024
+    print(f" -> Đã gộp {len(metadata_OD):,} frames OD vào {CACHE_META_OD_PATH} ({od_mb:.1f} MB)")
 
     # 3. OCR
     print("\n[3/5] Gộp dữ liệu OCR JSON...")
@@ -409,21 +465,33 @@ def build_all_caches():
             except Exception: pass
     with open(CACHE_META_OCR_PATH, "wb") as f:
         pickle.dump(loaded_ocr_data, f)
-    print(f" -> Đã lưu {len(loaded_ocr_data):,} mục OCR vào {CACHE_META_OCR_PATH}")
+    ocr_mb = os.path.getsize(CACHE_META_OCR_PATH) / 1024 / 1024
+    print(f" -> Đã lưu {len(loaded_ocr_data):,} mục OCR vào {CACHE_META_OCR_PATH} ({ocr_mb:.1f} MB)")
 
     # 4. Map-Keyframes & KeyframeMapper
     print("\n[4/5] Xây dựng bản đồ chuyển đổi ID Keyframe (map-keyframes)...")
     km = KeyframeMapper(auto_load=False)
     km.load(force_reload=True)
-    print(f" -> Đã lập bản đồ thời gian cho {len(km.n_to_meta):,} videos vào {CACHE_MAPPER_PATH}")
+    mapper_mb = os.path.getsize(CACHE_MAPPER_PATH) / 1024 / 1024
+    print(f" -> Đã lập bản đồ thời gian cho {len(km.n_to_meta):,} videos vào {CACHE_MAPPER_PATH} ({mapper_mb:.1f} MB)")
 
-    # 5. ASR Inverted Index
-    print("\n[5/5] Tiền xử lý & Lập chỉ mục ngược ASR (Speech Transcript)...")
+    # 5. ASR Inverted Index — Đã lọc stop words
+    print(f"\n[5/5] Tiền xử lý & Lập chỉ mục ngược ASR (lọc {len(VIETNAMESE_STOP_WORDS)} stop words)...")
     asrp = ASRPreprocessor()
     asrp.process_all(save_cache=True)
 
+    # Tổng kết
     print("\n" + "=" * 60)
-    print("🎉 HOÀN TẤT TIỀN XỬ LÝ TOÀN BỘ 5 MÔ HÌNH VÀ BẢN ĐỒ ID KEYFRAME!")
+    total_mb = 0
+    for cache_file in [CACHE_FAISS_PATH, CACHE_META_CLIP_PATH, CACHE_META_OD_PATH,
+                        CACHE_META_OCR_PATH, CACHE_MAPPER_PATH, CACHE_ASR_INDEX_PATH]:
+        if os.path.exists(cache_file):
+            mb = os.path.getsize(cache_file) / 1024 / 1024
+            total_mb += mb
+            print(f"  {os.path.basename(cache_file):35s} {mb:>8.1f} MB")
+    print(f"  {'TỔNG':35s} {total_mb:>8.1f} MB")
+    print("=" * 60)
+    print("🎉 HOÀN TẤT TIỀN XỬ LÝ TOÀN BỘ 5 MÔ HÌNH (OPTIMIZED)!")
     print("=" * 60)
 
 if __name__ == "__main__":
